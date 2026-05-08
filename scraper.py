@@ -12,7 +12,7 @@ URLS = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
 SEEN_FILE = "seen.json"
@@ -31,17 +31,46 @@ def scrape(url):
     r = requests.get(url, headers=HEADERS)
     soup = BeautifulSoup(r.text, "html.parser")
     annonces = []
-    for item in soup.select("[data-listing-id]"):
-        id_ = item["data-listing-id"]
-        titre = item.select_one("[class*='title']")
-        prix = item.select_one("[class*='price']")
-        lien = "https://www.kijiji.ca" + item.select_one("a")["href"] if item.select_one("a") else ""
+    
+    # Kijiji utilise des attributs data-listing-id ou id sur les li
+    items = soup.find_all("li", attrs={"data-listing-id": True})
+    
+    # Fallback: cherche tous les articles avec un lien vers /v-
+    if not items:
+        items = soup.find_all("div", class_=lambda x: x and "regular-ad" in x)
+    
+    if not items:
+        # Dernier recours: tous les liens /v- uniques
+        liens = soup.find_all("a", href=lambda x: x and "/v-" in x and x.startswith("/"))
+        seen_hrefs = set()
+        for lien in liens:
+            href = lien.get("href", "")
+            if href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+            titre = lien.get_text(strip=True)
+            if len(titre) > 10:
+                annonces.append({
+                    "id": href,
+                    "titre": titre,
+                    "prix": "",
+                    "lien": "https://www.kijiji.ca" + href
+                })
+        return annonces
+    
+    for item in items:
+        id_ = item.get("data-listing-id", "")
+        titre = item.find(class_=lambda x: x and "title" in x.lower()) if item else None
+        prix = item.find(class_=lambda x: x and "price" in x.lower()) if item else None
+        lien_tag = item.find("a", href=lambda x: x and "/v-" in x)
+        lien = "https://www.kijiji.ca" + lien_tag["href"] if lien_tag else ""
         annonces.append({
             "id": id_,
-            "titre": titre.text.strip() if titre else "Sans titre",
-            "prix": prix.text.strip() if prix else "Prix non indiqué",
+            "titre": titre.get_text(strip=True) if titre else "Sans titre",
+            "prix": prix.get_text(strip=True) if prix else "",
             "lien": lien
         })
+    
     return annonces
 
 def envoyer_email(nouvelles):
@@ -69,6 +98,7 @@ def main():
     
     for url in URLS:
         annonces = scrape(url)
+        print(f"Trouvé {len(annonces)} annonces sur {url}")
         for a in annonces:
             if a["id"] not in seen:
                 nouvelles.append(a)
