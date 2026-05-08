@@ -1,19 +1,15 @@
-import requests
-from bs4 import BeautifulSoup
-import smtplib
+import asyncio
 import json
 import os
-from email.mime.text import MIMEText
+import smtplib
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from playwright.async_api import async_playwright
 
 URLS = [
     "https://www.kijiji.ca/b-maisons-a-louer/drummondville/c37l80019a1700217",
     "https://www.kijiji.ca/b-appartements-condos/drummondville/c37l80019a1700270"
 ]
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
 
 SEEN_FILE = "seen.json"
 
@@ -27,50 +23,33 @@ def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
         json.dump(list(seen), f)
 
-def scrape(url):
-    r = requests.get(url, headers=HEADERS)
-    soup = BeautifulSoup(r.text, "html.parser")
+async def scrape(page, url):
+    await page.goto(url, wait_until="networkidle", timeout=30000)
+    await page.wait_for_timeout(3000)
+    
     annonces = []
-    
-    # Kijiji utilise des attributs data-listing-id ou id sur les li
-    items = soup.find_all("li", attrs={"data-listing-id": True})
-    
-    # Fallback: cherche tous les articles avec un lien vers /v-
-    if not items:
-        items = soup.find_all("div", class_=lambda x: x and "regular-ad" in x)
-    
-    if not items:
-        # Dernier recours: tous les liens /v- uniques
-        liens = soup.find_all("a", href=lambda x: x and "/v-" in x and x.startswith("/"))
-        seen_hrefs = set()
-        for lien in liens:
-            href = lien.get("href", "")
-            if href in seen_hrefs:
-                continue
-            seen_hrefs.add(href)
-            titre = lien.get_text(strip=True)
-            if len(titre) > 10:
-                annonces.append({
-                    "id": href,
-                    "titre": titre,
-                    "prix": "",
-                    "lien": "https://www.kijiji.ca" + href
-                })
-        return annonces
+    items = await page.query_selector_all("[data-listing-id]")
     
     for item in items:
-        id_ = item.get("data-listing-id", "")
-        titre = item.find(class_=lambda x: x and "title" in x.lower()) if item else None
-        prix = item.find(class_=lambda x: x and "price" in x.lower()) if item else None
-        lien_tag = item.find("a", href=lambda x: x and "/v-" in x)
-        lien = "https://www.kijiji.ca" + lien_tag["href"] if lien_tag else ""
-        annonces.append({
-            "id": id_,
-            "titre": titre.get_text(strip=True) if titre else "Sans titre",
-            "prix": prix.get_text(strip=True) if prix else "",
-            "lien": lien
-        })
+        id_ = await item.get_attribute("data-listing-id")
+        titre_el = await item.query_selector("[class*='title']")
+        prix_el = await item.query_selector("[class*='price']")
+        lien_el = await item.query_selector("a[href*='/v-']")
+        
+        titre = await titre_el.inner_text() if titre_el else "Sans titre"
+        prix = await prix_el.inner_text() if prix_el else ""
+        href = await lien_el.get_attribute("href") if lien_el else ""
+        lien = "https://www.kijiji.ca" + href if href else ""
+        
+        if id_:
+            annonces.append({
+                "id": id_,
+                "titre": titre.strip(),
+                "prix": prix.strip(),
+                "lien": lien
+            })
     
+    print(f"Trouvé {len(annonces)} annonces sur {url}")
     return annonces
 
 def envoyer_email(nouvelles):
@@ -92,17 +71,24 @@ def envoyer_email(nouvelles):
         server.login(EMAIL, PASSWORD)
         server.sendmail(EMAIL, EMAIL, msg.as_string())
 
-def main():
+async def main():
     seen = load_seen()
     nouvelles = []
     
-    for url in URLS:
-        annonces = scrape(url)
-        print(f"Trouvé {len(annonces)} annonces sur {url}")
-        for a in annonces:
-            if a["id"] not in seen:
-                nouvelles.append(a)
-                seen.add(a["id"])
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        )
+        
+        for url in URLS:
+            annonces = await scrape(page, url)
+            for a in annonces:
+                if a["id"] not in seen:
+                    nouvelles.append(a)
+                    seen.add(a["id"])
+        
+        await browser.close()
     
     if nouvelles:
         envoyer_email(nouvelles)
@@ -112,4 +98,4 @@ def main():
         print("Aucune nouvelle annonce.")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
